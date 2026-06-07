@@ -1,0 +1,16 @@
+# Python env
+.venv/
+__pycache__/
+*.pyc
+
+# Generated media + models (large; regenerate with the scripts)
+out/
+
+# Local backups / iteration snapshots
+backup_v1/
+backup_v2/
+backup_nav/
+
+# Tooling / OS
+.claude/
+.DS_Store

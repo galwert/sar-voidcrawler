@@ -1,0 +1,4 @@
+# Sudo-free synthetic rubble-exploration SLAM stack (install into ./.venv)
+numpy
+open3d>=0.19      # synthetic 3D lidar (raycasting), ICP registration, point clouds
+matplotlib        # 2D occupancy + the 3D exploration animation (headless, no GPU)
