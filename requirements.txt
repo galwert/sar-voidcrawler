@@ -1,4 +1,11 @@
-# Sudo-free synthetic rubble-exploration SLAM stack (install into ./.venv)
+# Core stack — install into ./.venv (pip, sudo-free).
+# Drives the SLAM, navigation, human-part scan, camera/seismic demos, console screenshots, figures/clips.
 numpy
-open3d>=0.19      # synthetic 3D lidar (raycasting), ICP registration, point clouds
-matplotlib        # 2D occupancy + the 3D exploration animation (headless, no GPU)
+open3d>=0.19      # synthetic 3D lidar (raycasting + geometry_ids), ICP registration, point clouds
+matplotlib        # 2D occupancy + the 3D animations (headless, no GPU)
+pillow            # image handling for the camera-feed demos + console screenshots
+
+# NOTE: scripts/sam_blocks.py (SAM2 block segmentation -> depth -> material) is NOT part of this venv.
+# It runs in the heavier "thesis" conda env, which provides: segment-anything-2 (sam2) + checkpoints,
+# torch (CPU), transformers (Depth-Anything-V2 + CLIP), opencv-python, scipy. Run it with:
+#   /home/wertheizer/miniforge3/envs/thesis/bin/python scripts/sam_blocks.py

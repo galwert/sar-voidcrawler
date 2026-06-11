@@ -40,6 +40,28 @@ CHECK_R = 6        # cells (~0.7 m): "passing near" a hotspot (with line-of-sigh
 REPLAN = 5         # replan every N steps (not every step)
 NB = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
       (-1, -1, 1.414), (-1, 1, 1.414), (1, -1, 1.414), (1, 1, 1.414)]
+PART_COLORS = {"head": "#ff4545", "torso": "#ffa31a", "arm": "#37e06a", "leg": "#3aa0ff"}
+
+
+def _cyl(p0, p1, r):
+    p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
+    v = p1 - p0; L = float(np.linalg.norm(v))
+    m = o3d.geometry.TriangleMesh.create_cylinder(radius=r, height=max(L, 1e-3), resolution=12)
+    vn = v / (L or 1.0); z = np.array([0, 0, 1.0]); a = np.cross(z, vn); s = np.linalg.norm(a); c = float(np.dot(z, vn))
+    if s > 1e-6:
+        m.rotate(o3d.geometry.get_rotation_matrix_from_axis_angle(a / s * np.arctan2(s, c)), center=(0, 0, 0))
+    elif c < 0:
+        m.rotate(o3d.geometry.get_rotation_matrix_from_axis_angle([np.pi, 0, 0]), center=(0, 0, 0))
+    m.translate((p0 + p1) / 2); return m
+
+
+def _sph(c, r):
+    m = o3d.geometry.TriangleMesh.create_sphere(r); m.translate(c); return m
+
+
+def _obox(center, sx, sy, sz, ex, ey):
+    m = o3d.geometry.TriangleMesh.create_box(sx, sy, sz); m.translate((-sx / 2, -sy / 2, -sz / 2))
+    m.rotate(np.column_stack([ex, ey, np.cross(ex, ey)]), center=(0, 0, 0)); m.translate(center); return m
 
 
 def bresenham(a, b):
@@ -244,8 +266,61 @@ def main():
     lo3, hi3 = cloud.min(0) - 0.3, cloud.max(0) + 0.3
     ctr, half = (lo3 + hi3) / 2, (hi3 - lo3) / 2
     zmax = max(2.0, hi3[2])
-    F = min(140, len(frames))
-    idx = np.linspace(0, len(frames) - 1, F).astype(int)
+    # ---- arriving at the last hotspot, do a dense 360° scan and segment a buried survivor ----
+    #  Only parts not hidden under the collapsed slab return points -> partial visibility, like the
+    #  Gemini photos (a hand / forearm reaching out; head and body occluded).
+    eye = np.array([rw3[-1, 0], rw3[-1, 1], 0.35])
+    hd0 = rw3[-1, :2] - rw3[max(0, len(rw3) - 4), :2]
+    hd0 = hd0 / (np.linalg.norm(hd0) or 1.0)
+    rcell = to_cell(rw3[-1, :2])
+    best = None                                            # place the survivor in a free, visible spot near the robot
+    for a in np.linspace(0, 2 * np.pi, 24, endpoint=False):
+        d = np.array([np.cos(a), np.sin(a)])
+        cand = rw3[-1, :2] + d * 0.85
+        cc = to_cell(cand)
+        if 0 <= cc[0] < W and 0 <= cc[1] < Hh and grid[cc] != OCC and line_of_sight(grid, rcell, cc):
+            sc = float(d @ hd0)
+            if best is None or sc > best[0]:
+                best = (sc, d, cand)
+    hd = best[1] if best else hd0
+    hc = best[2] if best else rw3[-1, :2] + hd * 0.85
+    ex = np.array([-hd[1], hd[0], 0.0]); ey = np.array([-hd[0], -hd[1], 0.0])   # body axis / toward-robot
+
+    def P(ap, at, z):                                      # ap = along body, at = toward robot
+        return (hc[0] + ap * ex[0] - at * hd[0], hc[1] + ap * ex[1] - at * hd[1], z)
+    z0 = 0.12
+    surv = [(_obox(P(0, 0, z0), 0.50, 0.30, 0.22, ex, ey), "torso"),
+            (_sph(P(0.40, 0.0, z0 + 0.02), 0.12), "head"),
+            (_cyl(P(-0.08, 0.06, z0), P(-0.58, 0.08, z0 - 0.02), 0.07), "leg"),
+            (_cyl(P(-0.08, -0.06, z0), P(-0.58, -0.08, z0 - 0.02), 0.07), "leg"),
+            (_cyl(P(0.10, 0.10, z0), P(0.04, 0.42, z0 - 0.02), 0.05), "arm"),
+            (_cyl(P(0.04, 0.42, z0 - 0.02), P(-0.02, 0.74, z0 - 0.03), 0.045), "arm"),
+            (_sph(P(-0.02, 0.74, z0 - 0.03), 0.05), "arm"),                     # hand reaching out
+            (_obox(P(0.0, -0.05, 0.30), 0.72, 0.70, 0.24, ex, ey), "occluder")]  # collapsed slab resting on the body
+    rc2 = o3d.t.geometry.RaycastingScene(); slabels = ["occluder"]
+    rc2.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))            # walls occlude too
+    for m, lab in surv:
+        rc2.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(m)); slabels.append(lab)
+    saz = np.linspace(-np.pi, np.pi, 1000, endpoint=False)
+    sel = np.deg2rad(np.linspace(-55, 12, 52))
+    AA, EE = np.meshgrid(saz, sel); AA, EE = AA.ravel(), EE.ravel()
+    sdir = np.stack([np.cos(EE) * np.cos(AA), np.cos(EE) * np.sin(AA), np.sin(EE)], 1).astype(np.float32)
+    rays = np.hstack([np.broadcast_to(eye.astype(np.float32), sdir.shape), sdir]).astype(np.float32)
+    sans = rc2.cast_rays(o3d.core.Tensor(rays))
+    st = sans["t_hit"].numpy(); sgid = sans["geometry_ids"].numpy()
+    sok = np.isfinite(st) & (st < 6.0)
+    spts = eye + sdir[sok] * st[sok, None] + rng.normal(0, 0.008, (int(sok.sum()), 3))
+    slab = np.array([slabels[g] for g in sgid[sok]])
+    keep = np.isin(slab, ["head", "torso", "arm", "leg"])
+    HP, HL = spts[keep], slab[keep]
+    print("   survivor parts visible:", {p: int((HL == p).sum()) for p in ["head", "torso", "arm", "leg"]})
+    haz = np.arctan2(HP[:, 1] - eye[1], HP[:, 0] - eye[0]) if len(HP) else np.zeros(0)
+    hord = np.argsort(haz); HP, HL, HA = HP[hord], HL[hord], (haz[hord] if len(HP) else haz)
+
+    F_nav = min(140, len(frames))
+    F_scan = 74                                            # zoom-in + sweep + a long hold on the segmented body
+    F = F_nav + F_scan
+    idx = np.linspace(0, len(frames) - 1, F_nav).astype(int)
 
     fig = plt.figure(figsize=(9.5, 7.2)); fig.patch.set_facecolor("black")
     ax = fig.add_subplot(111, projection="3d")
@@ -255,54 +330,99 @@ def main():
         return "lime" if vis[i] else ("magenta" if i == ti else "orange")
 
     def draw(f):
-        prog = f / max(1, F - 1)
-        n, _rc, _path, vis, ti, cov = frames[idx[f]]
-        c = cloud[:max(1, n)]
-        if len(c) > 14000:
-            c = c[::max(1, len(c) // 14000)]
-        tr = rw3[:idx[f] + 1]
-
         ax.cla(); ax.set_facecolor("black"); ax.set_axis_off()
         ax.set_position([-0.04, -0.02, 1.08, 1.06])
-        zoom = 1.3 - 0.3 * min(1.0, prog / 0.4)
-        L, Hh = ctr - half * zoom, ctr + half * zoom
-        ax.set_xlim(L[0], Hh[0]); ax.set_ylim(L[1], Hh[1]); ax.set_zlim(0, zmax)
-        ax.set_box_aspect((Hh[0] - L[0], Hh[1] - L[1], zmax * 2.6))
-        ax.scatter(c[:, 0], c[:, 1], c[:, 2], c=c[:, 2], cmap="turbo", s=2.2, depthshade=False, vmin=0, vmax=zmax)
-        ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color="cyan", lw=2.2, alpha=0.95)
-        for i in range(len(hotspots)):
-            ax.scatter([hs3[i, 0]], [hs3[i, 1]], [hs3[i, 2]], c=hcol(i, vis, ti), marker="*",
-                       s=420, edgecolors="black", depthshade=False)
-        ax.scatter([tr[-1, 0]], [tr[-1, 1]], [0.5], c="white", edgecolors="red", s=110, depthshade=False)
-        ax.view_init(elev=70 - 28 * min(1.0, prog / 0.4), azim=-80 + 130 * prog)
-
         inset.cla(); inset.set_facecolor("#0a0a0a"); inset.set_xticks([]); inset.set_yticks([]); inset.set_aspect("equal")
         for sp in inset.spines.values():
             sp.set_color("0.4")
-        inset.set_xlim(lo3[0], hi3[0]); inset.set_ylim(lo3[1], hi3[1])        # fixed frame, but starts empty
-        inset.scatter(c[:, 0], c[:, 1], s=0.6, c=c[:, 2], cmap="turbo", vmin=0, vmax=zmax, linewidths=0)
-        inset.plot(tr[:, 0], tr[:, 1], color="cyan", lw=0.9, alpha=0.6)        # where we've been
-        if _path and len(_path) > 1:                                          # where we're GOING (current plan)
-            pw = np.array([to_world(cc) for cc in _path])
-            inset.plot(pw[:, 0], pw[:, 1], color="yellow", lw=1.7)
-            a, b = pw[0], pw[min(10, len(pw) - 1)]
-            d = b - a; nd = np.linalg.norm(d)
-            if nd > 1e-6:
-                d = d / nd * 0.11 * (hi3[0] - lo3[0])
-                inset.annotate("", xy=(a[0] + d[0], a[1] + d[1]), xytext=(a[0], a[1]),
-                               arrowprops=dict(arrowstyle="-|>", color="yellow", lw=2.4))
-        for i in range(len(hotspots)):
-            inset.scatter([hs3[i, 0]], [hs3[i, 1]], c=hcol(i, vis, ti), marker="*", s=110, edgecolors="black", zorder=5)
-        inset.scatter([tr[-1, 0]], [tr[-1, 1]], c="white", edgecolors="red", s=34, zorder=6)
+        inset.set_xlim(lo3[0], hi3[0]); inset.set_ylim(lo3[1], hi3[1])
 
-        fig.suptitle(f"Reaching known hotspots — checked {sum(vis)}/{len(hotspots)}  |  mapped {cov:.0f}%"
-                     f"   ({'prior-aided' if args.prior else 'no prior'})", color="white", fontsize=12, y=0.97)
+        if f < F_nav:
+            prog = f / max(1, F_nav - 1)
+            n, _rc, _path, vis, ti, cov = frames[idx[f]]
+            c = cloud[:max(1, n)]
+            if len(c) > 14000:
+                c = c[::max(1, len(c) // 14000)]
+            tr = rw3[:idx[f] + 1]
+            zoom = 1.3 - 0.3 * min(1.0, prog / 0.4)
+            L, Hh = ctr - half * zoom, ctr + half * zoom
+            ax.set_xlim(L[0], Hh[0]); ax.set_ylim(L[1], Hh[1]); ax.set_zlim(0, zmax)
+            ax.set_box_aspect((Hh[0] - L[0], Hh[1] - L[1], zmax * 2.6))
+            ax.scatter(c[:, 0], c[:, 1], c[:, 2], c=c[:, 2], cmap="turbo", s=2.2, depthshade=False, vmin=0, vmax=zmax)
+            ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color="cyan", lw=2.2, alpha=0.95)
+            for i in range(len(hotspots)):
+                ax.scatter([hs3[i, 0]], [hs3[i, 1]], [hs3[i, 2]], c=hcol(i, vis, ti), marker="*",
+                           s=420, edgecolors="black", depthshade=False)
+            ax.scatter([tr[-1, 0]], [tr[-1, 1]], [0.5], c="white", edgecolors="red", s=110, depthshade=False)
+            ax.view_init(elev=70 - 28 * min(1.0, prog / 0.4), azim=-80 + 130 * prog)
+
+            inset.scatter(c[:, 0], c[:, 1], s=0.6, c=c[:, 2], cmap="turbo", vmin=0, vmax=zmax, linewidths=0)
+            inset.plot(tr[:, 0], tr[:, 1], color="cyan", lw=0.9, alpha=0.6)
+            if _path and len(_path) > 1:
+                pw = np.array([to_world(cc) for cc in _path])
+                inset.plot(pw[:, 0], pw[:, 1], color="yellow", lw=1.7)
+                a, b = pw[0], pw[min(10, len(pw) - 1)]
+                d = b - a; nd = np.linalg.norm(d)
+                if nd > 1e-6:
+                    d = d / nd * 0.11 * (hi3[0] - lo3[0])
+                    inset.annotate("", xy=(a[0] + d[0], a[1] + d[1]), xytext=(a[0], a[1]),
+                                   arrowprops=dict(arrowstyle="-|>", color="yellow", lw=2.4))
+            for i in range(len(hotspots)):
+                inset.scatter([hs3[i, 0]], [hs3[i, 1]], c=hcol(i, vis, ti), marker="*", s=110, edgecolors="black", zorder=5)
+            inset.scatter([tr[-1, 0]], [tr[-1, 1]], c="white", edgecolors="red", s=34, zorder=6)
+            fig.suptitle(f"Reaching known hotspots — checked {sum(vis)}/{len(hotspots)}  |  mapped {cov:.0f}%"
+                         f"   ({'prior-aided' if args.prior else 'no prior'})", color="white", fontsize=12, y=0.97)
+        else:
+            k = f - F_nav
+            near = (np.abs(cloud[:, 0] - hc[0]) < 3.0) & (np.abs(cloud[:, 1] - hc[1]) < 3.0)
+            c = cloud[near]                                                   # only nearby walls -> clean scan view
+            if len(c) > 8000:
+                c = c[::max(1, len(c) // 8000)]
+            zt = min(1.0, k / 16.0); zt = zt * zt * (3 - 2 * zt)              # ease the zoom-in
+            cx = ctr[0] * (1 - zt) + hc[0] * zt; cy = ctr[1] * (1 - zt) + hc[1] * zt
+            hr = (half[0] + half[1]) / 2 * (1 - zt) + 1.15 * zt              # zoom in TIGHT on the body
+            ax.set_xlim(cx - hr, cx + hr); ax.set_ylim(cy - hr, cy + hr); ax.set_zlim(0, zmax)
+            ax.set_box_aspect((2 * hr, 2 * hr, zmax * 2.6))
+            if len(c):
+                ax.scatter(c[:, 0], c[:, 1], c[:, 2], c=c[:, 2], cmap="turbo", s=1.6, depthshade=False,
+                           vmin=0, vmax=zmax, alpha=0.16)                     # map faded to the background
+            ax.scatter([eye[0]], [eye[1]], [0.45], c="white", edgecolors="red", s=150, depthshade=False)
+            reveal = min(1.0, k / 46.0)
+            nrev = int(reveal * len(HP))
+            ang = HA[min(nrev, len(HP) - 1)] if len(HP) else 0.0
+            ax.plot([eye[0], eye[0] + 2.6 * np.cos(ang)], [eye[1], eye[1] + 2.6 * np.sin(ang)],
+                    [0.12, 0.12], color="cyan", lw=2.2, alpha=0.85)           # rotating scan beam
+            for lab in ["leg", "arm", "torso", "head"]:
+                m = HL[:nrev] == lab
+                if m.any():
+                    ax.scatter(HP[:nrev][m, 0], HP[:nrev][m, 1], HP[:nrev][m, 2], s=80,
+                               c=PART_COLORS[lab], depthshade=False, alpha=0.16)          # glow
+                    ax.scatter(HP[:nrev][m, 0], HP[:nrev][m, 1], HP[:nrev][m, 2], s=28,
+                               c=PART_COLORS[lab], depthshade=False, label=lab)
+            ax.view_init(elev=58 - 20 * min(1.0, k / F_scan), azim=40 + 55 * (k / F_scan))
+            if nrev > 0:
+                ax.legend(loc="upper left", fontsize=11, facecolor="0.1", labelcolor="white",
+                          markerscale=1.5, framealpha=0.85)
+
+            inset.scatter(cloud[::6, 0], cloud[::6, 1], s=0.5, c="0.4", linewidths=0)     # full-map context
+            inset.plot(rw3[:, 0], rw3[:, 1], color="cyan", lw=0.8, alpha=0.5)
+            for lab in ["leg", "arm", "torso", "head"]:
+                m = HL[:nrev] == lab
+                if m.any():
+                    inset.scatter(HP[:nrev][m, 0], HP[:nrev][m, 1], s=7, c=PART_COLORS[lab], linewidths=0)
+            inset.scatter([eye[0]], [eye[1]], c="white", edgecolors="red", s=30, zorder=6)
+            if reveal < 1.0:
+                ttl = "● 360° SCAN at hotspot — segmenting survivor…"
+            else:
+                seen = sorted(set(HL), key=lambda x: ["head", "torso", "arm", "leg"].index(x))
+                ttl = "SURVIVOR FOUND — parts: " + ", ".join(seen)
+            fig.suptitle(ttl, color=("#ff6060" if reveal >= 1 else "white"), fontsize=13, y=0.97)
         return []
 
     out = os.path.join(OUT, "navigate_prior.mp4" if args.prior else "navigate.mp4")
     ff = shutil.which("ffmpeg") or next(
         (p for p in glob.glob(os.path.expanduser("~/miniforge3/envs/*/bin/ffmpeg")) if os.path.exists(p)), None)
-    print(f"rendering {F} frames -> {out} ...")
+    print(f"rendering {F} frames ({F_nav} nav + {F_scan} scan) -> {out} ...")
     anim = FuncAnimation(fig, draw, frames=F, blit=False)
     if ff:
         plt.rcParams["animation.ffmpeg_path"] = ff
